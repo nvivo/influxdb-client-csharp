@@ -6,8 +6,10 @@ using System.Linq;
 using System.Threading;
 using InfluxDB.Client.Api.Domain;
 using InfluxDB.Client.Core;
+using InfluxDB.Client.Internal;
 using InfluxDB.Client.Writes;
 using NodaTime;
+using NodaTime.Extensions;
 using NUnit.Framework;
 using Duration = NodaTime.Duration;
 using Task = System.Threading.Tasks.Task;
@@ -433,9 +435,9 @@ namespace InfluxDB.Client.Test
             _writeApi.WriteRecord(bucketName, _organization.Id, WritePrecision.Ns,
                 "h2o_feet,location=coyote_creek level\\ water_level=1.0 123456.789");
             _writeApi.Flush();
-            
+
             var error = listener.Get<WriteErrorEvent>();
-            
+
             Assert.IsNotNull(error);
             Assert.AreEqual(
                 "unable to parse 'h2o_feet,location=coyote_creek level\\ water_level=1.0 123456.789': bad timestamp",
@@ -482,7 +484,7 @@ namespace InfluxDB.Client.Test
                 _organization.Id);
             Assert.AreEqual(0, query.Count);
         }
-        
+
         [Test]
         public async Task SimpleWriteAndDisposing()
         {
@@ -492,12 +494,13 @@ namespace InfluxDB.Client.Test
 
                 using (var writeApi = client.GetWriteApi())
                 {
-                    writeApi.WriteRecord(_bucket.Name, _organization.Id, WritePrecision.Ns, "temperature,location=north value=60.0 1");
+                    writeApi.WriteRecord(_bucket.Name, _organization.Id, WritePrecision.Ns,
+                        "temperature,location=north value=60.0 1");
                 }
-            
+
                 client.Dispose();
             }
-            
+
             // Using both
             {
                 using (var client = InfluxDBClientFactory.Create(InfluxDbUrl, _token))
@@ -509,7 +512,7 @@ namespace InfluxDB.Client.Test
                     }
                 }
             }
-            
+
             // Using without
             {
                 var client = InfluxDBClientFactory.Create(InfluxDbUrl, _token);
@@ -520,11 +523,11 @@ namespace InfluxDB.Client.Test
 
                 client.Dispose();
             }
-            
+
             var tables = await _queryApi.QueryAsync(
                 $"from(bucket:\"{_bucket.Name}\") |> range(start: 1970-01-01T00:00:00.000000001Z)",
                 _organization.Id);
-            
+
             Assert.AreEqual(1, tables.Count);
             Assert.AreEqual(3, tables[0].Records.Count);
             Assert.AreEqual(60, tables[0].Records[0].GetValue());
@@ -869,7 +872,7 @@ namespace InfluxDB.Client.Test
             Assert.AreEqual(2, records[1].GetValue());
             Assert.AreEqual("level water_level", records[1].GetField());
         }
-        
+
         [Test]
         public async Task WriteTooManyData()
         {
@@ -877,7 +880,7 @@ namespace InfluxDB.Client.Test
 
             const int count = 500_000;
             const int batchSize = 50_000;
-            
+
             var measurements = new List<H20Measurement>();
 
             for (var i = 0; i < count; i++)
@@ -915,12 +918,204 @@ namespace InfluxDB.Client.Test
             Trace.WriteLine("Flushing data...");
             Client.Dispose();
             Trace.WriteLine("Finished");
-            
+
             Assert.AreEqual(10, successEvents.Count);
             foreach (var successEvent in successEvents)
             {
                 Assert.AreEqual(50_000, successEvent.LineProtocol.Split("\n").Length);
             }
+        }
+
+        [Measurement("point")]
+        private class Point
+        {
+            [Column("tag", IsTag = true)] public string Tag { get; set; }
+            [Column("my-value")] public double MyValue { get; set; }
+            [Column("time", IsTimestamp = true)] public DateTime Timestamp { get; set; }
+        }
+
+        [Measurement("point2")]
+        private class PointNoTimeColumnName
+        {
+            [Column("tag", IsTag = true)] public string Tag { get; set; }
+            [Column("my-value")] public double MyValue { get; set; }
+            [Column(IsTimestamp = true)] public DateTime Timestamp { get; set; }
+        }
+
+        [Test]
+        public void TimespampPocoDeserialization()
+        {
+            _writeApi?.Dispose();
+            var utcNow = DateTime.UtcNow;
+            _writeApi = Client.GetWriteApi();
+
+            Point[] points =
+            {
+                new Point() {Tag = "aTag", MyValue = 0, Timestamp = utcNow.Add(-TimeSpan.FromSeconds(5))},
+                new Point() {Tag = "aTag", MyValue = 1, Timestamp = utcNow.Add(-TimeSpan.FromSeconds(4))},
+                new Point() {Tag = "aTag", MyValue = 2, Timestamp = utcNow.Add(-TimeSpan.FromSeconds(3))},
+                new Point() {Tag = "aTag", MyValue = 3, Timestamp = utcNow.Add(-TimeSpan.FromSeconds(2))},
+                new Point() {Tag = "aTag", MyValue = 4, Timestamp = utcNow.Add(-TimeSpan.FromSeconds(1))},
+            };
+
+            var listener = new WriteApiTest.EventListener(_writeApi);
+
+            Console.WriteLine("bucket: " + _bucket.Name);
+            _writeApi.WriteMeasurements(_bucket.Name, _organization.Name, WritePrecision.Ns, points);
+            _writeApi.Flush();
+            Assert.AreEqual(0, listener.EventCount());
+
+            _queryApi = Client.GetQueryApi();
+
+            var queryString = $"from(bucket:\"{_bucket.Name}\") |> range(start: 1970-01-01T00:00:00.000000001Z)";
+            var resultTask = _queryApi.QueryAsync(queryString, _organization.Id);
+
+            Console.WriteLine(queryString);
+            var queryResult = resultTask.Result;
+            Assert.AreEqual(1, queryResult.Count);
+            Assert.AreEqual(5, queryResult[0].Records.Count);
+            Assert.AreEqual(utcNow.Add(-TimeSpan.FromSeconds(5)).ToInstant(), queryResult[0].Records[0].GetTime());
+
+            for (int i = 0; i < queryResult.Count; i++)
+            {
+                var fluxTable = queryResult[i];
+                Console.WriteLine(fluxTable);
+            }
+
+            List<Point> notTimestampPoints = new List<Point>();
+
+            _queryApi.QueryAsync<Point>(
+                    queryString + " |> pivot(rowKey:[\"_time\"], columnKey: [\"_field\"], valueColumn: \"_value\")",
+                    _organization.Name,
+                    (cancellable, point) =>
+                    {
+                        // process the flux query records
+                        if (point.Timestamp == null || point.Timestamp.Equals(DateTime.MinValue))
+                        {
+                            notTimestampPoints.Add(point);
+                        }
+
+                        Console.WriteLine(((DateTime) point.Timestamp).ToString("yyyy-MM-dd-HH:mm:ss.FFF"));
+                    },
+                    (error) => { Console.WriteLine(error.ToString()); },
+                    () => { Console.WriteLine("Query completed"); })
+                .Wait();
+
+            Assert.AreEqual(0, notTimestampPoints.Count);
+        }
+
+        [Test]
+        public void TimespampPocoDeserializationNoTimeColumn()
+        {
+            _writeApi?.Dispose();
+            var utcNow = DateTime.UtcNow;
+            _writeApi = Client.GetWriteApi();
+
+            PointNoTimeColumnName[] points =
+            {
+                new PointNoTimeColumnName()
+                    {Tag = "aTag", MyValue = 0, Timestamp = utcNow.Add(-TimeSpan.FromSeconds(5))},
+                new PointNoTimeColumnName()
+                    {Tag = "aTag", MyValue = 1, Timestamp = utcNow.Add(-TimeSpan.FromSeconds(4))},
+                new PointNoTimeColumnName()
+                    {Tag = "aTag", MyValue = 2, Timestamp = utcNow.Add(-TimeSpan.FromSeconds(3))},
+                new PointNoTimeColumnName()
+                    {Tag = "aTag", MyValue = 3, Timestamp = utcNow.Add(-TimeSpan.FromSeconds(2))},
+                new PointNoTimeColumnName()
+                    {Tag = "aTag", MyValue = 4, Timestamp = utcNow.Add(-TimeSpan.FromSeconds(1))},
+            };
+
+            var listener = new WriteApiTest.EventListener(_writeApi);
+
+            Console.WriteLine("bucket: " + _bucket.Name);
+            _writeApi.WriteMeasurements(_bucket.Name, _organization.Name, WritePrecision.Ns, points);
+            _writeApi.Flush();
+            listener.WaitToSuccess();
+            Assert.AreEqual(0, listener.EventCount());
+
+            _queryApi = Client.GetQueryApi();
+
+            var queryString = $"from(bucket:\"{_bucket.Name}\") |> range(start: 1970-01-01T00:00:00.000000001Z)";
+            var resultTask = _queryApi.QueryAsync(queryString, _organization.Id);
+
+            Console.WriteLine(queryString);
+            var queryResult = resultTask.Result;
+            Assert.AreEqual(1, queryResult.Count);
+            Assert.AreEqual(5, queryResult[0].Records.Count);
+            Assert.AreEqual(utcNow.Add(-TimeSpan.FromSeconds(5)).ToInstant(), queryResult[0].Records[0].GetTime());
+
+            for (int i = 0; i < queryResult.Count; i++)
+            {
+                var fluxTable = queryResult[i];
+                Console.WriteLine(fluxTable);
+            }
+
+            List<PointNoTimeColumnName> res = new List<PointNoTimeColumnName>(); 
+            _queryApi.QueryAsync<PointNoTimeColumnName>(
+                    queryString + " |> pivot(rowKey:[\"_time\"], columnKey: [\"_field\"], valueColumn: \"_value\")",
+                    _organization.Name,
+                    (cancellable, point) =>
+                    {
+                        res.Add(point);
+                        Console.WriteLine(((DateTime) point.Timestamp).ToString("yyyy-MM-dd-HH:mm:ss.FFF"));
+                    },
+                    (error) => { Console.WriteLine(error.ToString()); },
+                    () => { Console.WriteLine("Query completed"); })
+                .Wait();
+
+            Assert.AreEqual(5, res.Count);
+            foreach (PointNoTimeColumnName pointNoTimeColumnName in res)
+            {
+                Assert.IsTrue(pointNoTimeColumnName.Timestamp > DateTime.MinValue);    
+            }
+        }
+
+        [Test]
+        public void MeasurementMapperExceptionPropagation()
+        {
+            _writeApi?.Dispose();
+            _writeApi = Client.GetWriteApi();
+
+            MeasurementMapper mp = new MeasurementMapper();
+            //this shout be DateTime.UtcNow
+            var utcNow = DateTime.Now;
+
+            // throws ArgumentException for non UTC datetime
+            // Assert.Throws<ArgumentException>(() =>
+            // mp.ToPoint(new Point() {Tag = "aTag", MyValue = 0, Timestamp = utcNow},
+            // WritePrecision.Ms));
+
+            mp.ToPoint(new Point() {Tag = "aTag", MyValue = 0, Timestamp = utcNow},
+                WritePrecision.Ms);
+
+            Point[] points =
+            {
+                new Point() {Tag = "aTag", MyValue = 0, Timestamp = utcNow.Add(-TimeSpan.FromSeconds(5))},
+                new Point() {Tag = "aTag", MyValue = 1, Timestamp = utcNow.Add(-TimeSpan.FromSeconds(4))},
+                new Point() {Tag = "aTag", MyValue = 2, Timestamp = utcNow.Add(-TimeSpan.FromSeconds(3))},
+                new Point() {Tag = "aTag", MyValue = 3, Timestamp = utcNow.Add(-TimeSpan.FromSeconds(2))},
+                new Point() {Tag = "aTag", MyValue = 4, Timestamp = utcNow.Add(-TimeSpan.FromSeconds(1))},
+            };
+
+            var listener = new WriteApiTest.EventListener(_writeApi);
+            Console.WriteLine("bucket: " + _bucket.Name);
+            _writeApi.WriteMeasurements(_bucket.Name, _organization.Name, WritePrecision.Ns, points);
+            _writeApi.Flush();
+
+            // Assert.Greater(0, listener.EventCount());
+
+            _queryApi = Client.GetQueryApi();
+
+            var queryString = $"from(bucket:\"{_bucket.Name}\") |> range(start: 1970-01-01T00:00:00.000000001Z)";
+            var resultTask = _queryApi.QueryAsync(queryString, _organization.Id);
+
+            Console.WriteLine(queryString);
+            var queryResult = resultTask.Result;
+            Assert.AreEqual(1, queryResult.Count);
+            Assert.AreEqual(5, queryResult[0].Records.Count);
+            Assert.AreEqual(TimeZoneInfo.ConvertTimeToUtc(utcNow, TimeZoneInfo.Local)
+                    .Add(-TimeSpan.FromSeconds(5)).ToInstant(),
+                queryResult[0].Records[0].GetTime());
         }
     }
 }
